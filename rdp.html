@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NetControl - RDP Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      max-width: 600px;
+      width: 100%;
+      text-align: center;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+      color: #58a6ff;
+    }
+    .subtitle {
+      color: #7d8590;
+      margin-bottom: 32px;
+    }
+    .ip-display {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .ip-display .label {
+      font-size: 13px;
+      color: #7d8590;
+      margin-bottom: 8px;
+    }
+    .ip-display .ip {
+      font-size: 32px;
+      font-weight: 600;
+      color: #3fb950;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 16px 24px;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      border: none;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: #238636;
+      color: white;
+    }
+    .btn-primary:hover {
+      background: #2ea043;
+    }
+    .btn-secondary {
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+    }
+    .btn-secondary:hover {
+      background: #30363d;
+    }
+    .info {
+      margin-top: 32px;
+      padding: 16px;
+      background: rgba(88, 166, 255, 0.1);
+      border: 1px solid rgba(88, 166, 255, 0.2);
+      border-radius: 8px;
+      font-size: 14px;
+      color: #7d8590;
+    }
+    .back-link {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      background: #21262d;
+      color: #c9d1d9;
+      padding: 10px 16px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 13px;
+      border: 1px solid #30363d;
+    }
+    .back-link:hover { background: #30363d; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🖥️ Escritorio Remoto</h1>
+    <p class="subtitle">Conexión RDP a Windows</p>
+    
+    <div class="ip-display">
+      <div class="label">Dirección IP</div>
+      <div class="ip" id="target-ip">---.---.---.---</div>
+    </div>
+    
+    <div class="actions">
+      <button class="btn btn-primary" onclick="connectRDP()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>
+        </svg>
+        Conectar con RDP
+      </button>
+      <button class="btn btn-secondary" onclick="connectVNC()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="2" width="20" height="20" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><circle cx="15.5" cy="8.5" r="1.5"/>
+        </svg>
+        Conectar con VNC (si está disponible)
+      </button>
+    </div>
+    
+    <div class="info">
+      <strong>Nota:</strong> La conexión RDP abrirá el cliente de Escritorio Remoto de Windows (mstsc).<br>
+      Asegúrate de tener permisos de acceso al equipo remoto.
+    </div>
+  </div>
+  
+  <a href="/" class="back-link">← Volver al Scanner</a>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const ip = urlParams.get('ip') || '192.168.227.1';
+    
+    document.getElementById('target-ip').textContent = ip;
+    
+    function connectRDP() {
+      // Try Windows RDP protocol
+      const rdpUrl = 'ms-rd://' + ip + ':3389';
+      
+      // Try to open RDP
+      const link = document.createElement('a');
+      link.href = rdpUrl;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      // Also try alternative
+      setTimeout(() => {
+        window.location.href = 'rdp://full address=s:' + ip + ':3389';
+      }, 500);
+    }
+    
+    function connectVNC() {
+      // Open noVNC if available
+      const vncUrl = '/noVNC/vnc.html?host=' + window.location.hostname + '&port=6080&path=vnc&resize=scale';
+      window.open(vncUrl, '_blank');
+    }
+  </script>
+</body>
+</html>

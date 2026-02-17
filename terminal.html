@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NetControl - Terminal SSH</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .header h1 {
+      font-size: 16px;
+      font-weight: 500;
+      color: #58a6ff;
+    }
+    .connection-info {
+      color: #7d8590;
+      font-size: 13px;
+    }
+    .connection-info span {
+      color: #3fb950;
+    }
+    .status {
+      margin-left: auto;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .status.connecting { background: rgba(88, 166, 255, 0.15); color: #58a6ff; }
+    .status.connected { background: rgba(63, 185, 80, 0.15); color: #3fb950; }
+    .status.error { background: rgba(218, 54, 51, 0.15); color: #f85149; }
+    .status.disconnected { background: rgba(139, 148, 158, 0.15); color: #8b949e; }
+    
+    #terminal-container {
+      flex: 1;
+      padding: 16px;
+      background: #0d1117;
+    }
+    
+    .login-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(13, 17, 23, 0.95);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .login-overlay.hidden {
+      display: none;
+    }
+    .login-form {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 32px;
+      width: 360px;
+    }
+    .login-form h2 {
+      font-size: 20px;
+      margin-bottom: 24px;
+      color: #58a6ff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .login-form .field {
+      margin-bottom: 20px;
+    }
+    .login-form label {
+      display: block;
+      font-size: 13px;
+      color: #7d8590;
+      margin-bottom: 8px;
+    }
+    .login-form input {
+      width: 100%;
+      padding: 12px 14px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      color: #e6edf3;
+      font-size: 15px;
+    }
+    .login-form input:focus {
+      outline: none;
+      border-color: #58a6ff;
+    }
+    .login-form button {
+      width: 100%;
+      padding: 14px;
+      background: #238636;
+      border: none;
+      border-radius: 8px;
+      color: white;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .login-form button:hover {
+      background: #2ea043;
+    }
+    .login-form button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .login-form .error {
+      color: #f85149;
+      font-size: 13px;
+      margin-top: 16px;
+      display: none;
+      padding: 12px;
+      background: rgba(218, 54, 51, 0.1);
+      border-radius: 6px;
+    }
+    .login-form .error.show {
+      display: block;
+    }
+    
+    .back-link {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: #21262d;
+      color: #c9d1d9;
+      padding: 10px 16px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 13px;
+      border: 1px solid #30363d;
+    }
+    .back-link:hover { background: #30363d; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🖥️ Terminal SSH</h1>
+    <div class="connection-info">Conectando a <span id="target-ip">---.---.---.---</span></div>
+    <div class="status connecting" id="status">Conectando...</div>
+  </div>
+  
+  <div id="terminal-container"></div>
+  
+  <div class="login-overlay" id="login-overlay">
+    <div class="login-form">
+      <h2>🔐 Login SSH</h2>
+      <div class="field">
+        <label>Usuario</label>
+        <input type="text" id="ssh-user" value="manolo" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>Contraseña</label>
+        <input type="password" id="ssh-pass" autocomplete="current-password">
+      </div>
+      <button id="connect-btn" type="button">Conectar</button>
+      <div class="error" id="login-error">Credenciales incorrectas</div>
+    </div>
+  </div>
+  
+  <a href="/" class="back-link">← Volver al Scanner</a>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    let ip = urlParams.get('ip') || '192.168.227.58';
+    let currentUser = urlParams.get('user') || 'manolo';
+    
+    document.getElementById('target-ip').textContent = currentUser + '@' + ip;
+    document.getElementById('ssh-user').value = currentUser;
+    
+    const status = document.getElementById('status');
+    const loginOverlay = document.getElementById('login-overlay');
+    const loginError = document.getElementById('login-error');
+    const connectBtn = document.getElementById('connect-btn');
+    
+    let ws;
+    let term;
+    
+    // Initialize xterm
+    function initTerminal() {
+      term = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+        theme: {
+          background: '#0d1117',
+          foreground: '#e6edf3',
+          cursor: '#58a6ff',
+          selection: 'rgba(88, 166, 255, 0.3)',
+          black: '#484f58',
+          red: '#f85149',
+          green: '#3fb950',
+          yellow: '#d29922',
+          blue: '#58a6ff',
+          magenta: '#bc8cff',
+          cyan: '#56d4dd',
+          white: '#e6edf3',
+          brightBlack: '#6e7681',
+          brightRed: '#ffa198',
+          brightGreen: '#7ee787',
+          brightYellow: '#f0e68c',
+          brightBlue: '#79c0ff',
+          brightMagenta: '#d2a8ff',
+          brightCyan: '#76e3ea',
+          brightWhite: '#ffffff'
+        }
+      });
+      
+      const fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      
+      // Handle resize
+      window.addEventListener('resize', () => fitAddon.fit());
+      
+      // Handle user input
+      term.onData(data => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', data }));
+        }
+      });
+    }
+    
+    function connectSSH() {
+      const user = document.getElementById('ssh-user').value;
+      const pass = document.getElementById('ssh-pass').value;
+      
+      if (!user || !pass) {
+        loginError.textContent = 'Introduce usuario y contraseña';
+        loginError.classList.add('show');
+        return;
+      }
+      
+      currentUser = user;
+      document.getElementById('target-ip').textContent = user + '@' + ip;
+      
+      connectBtn.disabled = true;
+      connectBtn.textContent = 'Conectando...';
+      loginError.classList.remove('show');
+      
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}/ws/terminal?ip=${ip}&user=${user}&pass=${encodeURIComponent(pass)}`);
+      
+      ws.onopen = () => {
+        status.className = 'status connected';
+        status.textContent = 'Conectado';
+        loginOverlay.classList.add('hidden');
+        
+        // Initialize terminal after login form is hidden
+        setTimeout(() => {
+          initTerminal();
+          fitAddon.fit();
+        }, 100);
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'data' && term) {
+            term.write(data.data);
+          } else if (data.type === 'error') {
+            term.write('\r\n\x1b[31mError: ' + data.data + '\x1b[0m\r\n');
+            if (data.data.includes('auth')) {
+              loginError.textContent = 'Credenciales incorrectas';
+              loginError.classList.add('show');
+              status.className = 'status error';
+              status.textContent = 'Error de autenticación';
+              connectBtn.disabled = false;
+              connectBtn.textContent = 'Conectar';
+            }
+          } else if (data.type === 'close') {
+            status.className = 'status disconnected';
+            status.textContent = 'Desconectado';
+            if (term) {
+              term.write('\r\n\x1b[33mConexión cerrada\x1b[0m\r\n');
+            }
+            loginOverlay.classList.remove('hidden');
+          }
+        } catch (e) {
+          if (term) term.write(event.data);
+        }
+      };
+      
+      ws.onerror = (error) => {
+        status.className = 'status error';
+        status.textContent = 'Error de conexión';
+        connectBtn.disabled = false;
+        connectBtn.textContent = 'Conectar';
+      };
+      
+      ws.onclose = () => {
+        status.className = 'status disconnected';
+        status.textContent = 'Desconectado';
+        loginOverlay.classList.remove('hidden');
+      };
+    }
+    
+    // Allow Enter key to submit
+    document.getElementById('ssh-pass').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') connectSSH();
+    });
+    
+    // Connect button handler
+    document.getElementById('connect-btn').addEventListener('click', connectSSH);
+  </script>
+</body>
+</html>
