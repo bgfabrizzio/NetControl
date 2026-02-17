@@ -454,6 +454,16 @@
       
       grid.innerHTML = filteredHosts.map((host, i) => {
         const isOnline = host.status === 'online';
+        const ports = host.openPorts || [];
+        const hasSSH = ports.includes(22);
+        const hasRDP = ports.includes(3389);
+        const hasVNC = ports.includes(5900);
+        
+        // Tooltips explaining why buttons are disabled
+        const sshTooltip = hasSSH ? 'SSH (puerto 22 abierto)' : (host.os === 'windows' ? 'Windows: SSH no instalado o deshabilitado' : host.os === 'macos' ? 'MacOS: Habilitar "Inicio de sesión remoto"' : 'Linux: Instalar openssh-server o verificar servicio ssh');
+        const rdpTooltip = hasRDP ? 'RDP (puerto 3389 abierto)' : (host.os === 'linux' ? 'Linux: Instalar xrdp o usar VNC' : host.os === 'macos' ? 'MacOS: Usar Screen Sharing o VNC' : 'Windows: Habilitar Escritorio Remoto');
+        const vncTooltip = hasVNC ? 'VNC (puerto 5900 abierto)' : 'VNC no detectado (necesita servidor VNC)';
+        
         const osIcon = host.os === 'windows' 
           ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5l8-3v13l-8-3V5.5zm8-3v13l8-3v-13l-8 3zm8 16l-8-3v-13l8 3v13z"/></svg>'
           : host.os === 'macos'
@@ -469,9 +479,14 @@
             '<div class="detail"><label>Response</label><span>' + (host.responseTime ? host.responseTime + 'ms' : '-') + '</span></div>' +
             '<div class="detail"><label>Hostname</label><span>' + (host.hostname || '-') + '</span></div>' +
             '<div class="detail"><label>OS</label><span class="os-badge ' + host.os + '">' + osIcon + ' ' + host.os + '</span></div>' +
-            '<div class="detail"><label>Open Ports</label><span>' + (host.openPorts ? host.openPorts.join(', ') : '-') + '</span></div>' +
+            '<div class="detail"><label>Open Ports</label><span>' + (ports.length > 0 ? ports.join(', ') : '-') + '</span></div>' +
           '</div>' +
-          (isOnline ? '<div class="host-actions"><button class="host-btn" onclick="pingHost(\'' + host.ip + '\')">Ping</button><button class="host-btn" onclick="remoteDesktop(\'' + host.ip + '\')">RDP</button><button class="host-btn" onclick="sshHost(\'' + host.ip + '\')">SSH</button></div>' : '') +
+          (isOnline ? '<div class="host-actions">' +
+            '<button class="host-btn" onclick="pingHost(\'' + host.ip + '\')">Ping</button>' +
+            '<button class="host-btn" ' + (hasRDP ? '' : 'disabled') + ' onclick="if(' + hasRDP + ')remoteDesktop(\'' + host.ip + '\')" title="' + rdpTooltip + '">RDP</button>' +
+            '<button class="host-btn" ' + (hasSSH ? '' : 'disabled') + ' onclick="if(' + hasSSH + ')sshHost(\'' + host.ip + '\')" title="' + sshTooltip + '">SSH</button>' +
+            '<button class="host-btn" ' + (hasVNC ? '' : 'disabled') + ' onclick="if(' + hasVNC + ')vncHost(\'' + host.ip + '\')" title="' + vncTooltip + '">VNC</button>' +
+          '</div>' : '') +
         '</div>';
       }).join('');
       
@@ -525,6 +540,11 @@
     function sshHost(ip) {
       // Open integrated terminal
       window.open('/terminal.html?ip=' + ip + '&user=manolo', '_blank');
+    }
+    
+    function vncHost(ip) {
+      // Open noVNC viewer
+      window.open('/noVNC/vnc.html?host=' + ip + '&port=6080', '_blank');
     }
   </script>
 </body>
