@@ -1,13 +1,33 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec, spawn } = require('child_process');
-const dns = require('dns').promises;
+const { exec } = require('child_process');
+const { dns } = require('dns').promises;
 const { WebSocketServer } = require('ws');
 const { Client } = require('ssh2');
 const { AnsiUp } = require('ansi_up');
 
 const PORT = 3000;
+
+// ============ DATA PERSISTENCE ============
+const DATA_FILE = path.join(__dirname, 'data.json');
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.error('[DATA] Error loading:', e.message);
+  }
+  return { whitelist: [], devices: {} };
+}
+
+function saveData(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+let appData = loadData();
 
 // ============ NETWORK SCANNER ============
 
@@ -56,10 +76,36 @@ async function getHostname(ip) {
   }
 }
 
+async function getMacAddress(ip) {
+  return new Promise((resolve) => {
+    const cmd = process.platform === 'win32'
+      ? `arp -a ${ip}`
+      : `arp -n ${ip}`;
+    
+    exec(cmd, { timeout: 3000 }, (err, stdout) => {
+      if (err) {
+        resolve(null);
+        return;
+      }
+      
+      // Parse MAC address from ARP output
+      const macMatch = stdout.match(/([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})/);
+      if (macMatch) {
+        resolve(macMatch[0].toUpperCase());
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
 async function scanHost(ip) {
   const start = Date.now();
   const online = await ping(ip);
   const responseTime = Date.now() - start;
+  
+  const isWhitelisted = appData.whitelist.includes(ip);
+  const customName = appData.devices[ip]?.name;
   
   const host = {
     ip,
@@ -69,13 +115,23 @@ async function scanHost(ip) {
     mac: null,
     os: 'unknown',
     openPorts: [],
-    lastSeen: online ? new Date().toISOString() : null
+    lastSeen: online ? new Date().toISOString() : null,
+    isWhitelisted,
+    customName: customName || null,
+    type: appData.devices[ip]?.type || 'unknown'
   };
   
   if (online) {
     host.hostname = await getHostname(ip);
+    host.mac = await getMacAddress(ip);
     
-    const ports = [22, 80, 135, 139, 443, 445, 3389, 8080, 8443, 5900, 5000, 88, 548];
+    // Get device type from saved data
+    if (appData.devices[ip]) {
+      host.type = appData.devices[ip].type || 'unknown';
+      host.customName = appData.devices[ip].name || null;
+    }
+    
+    const ports = [22, 80, 135, 139, 443, 445, 3389, 8080, 8443, 5900, 5000, 88, 548, 631, 9100];
     const results = await Promise.allSettled(ports.map(p => checkPort(ip, p)));
     
     results.forEach((result, i) => {
@@ -86,15 +142,21 @@ async function scanHost(ip) {
     
     // Detect OS based on open ports
     if (host.openPorts.includes(5000) || host.openPorts.includes(548) || host.openPorts.includes(88)) {
-      // Apple ports - MacOS
       host.os = 'macos';
+      if (host.type === 'unknown') host.type = 'mac';
     } else if (host.openPorts.includes(22)) {
-      // Has SSH - could be Linux or Mac without AirPlay
       host.os = 'linux';
+      if (host.type === 'unknown') host.type = 'linux';
     } else if (host.openPorts.includes(3389) || host.openPorts.includes(135)) {
       host.os = 'windows';
+      if (host.type === 'unknown') host.type = 'pc';
+    } else if (host.openPorts.includes(631)) {
+      host.type = 'impresora';
+    } else if (host.openPorts.includes(9100)) {
+      host.type = 'impresora';
     } else if (host.openPorts.includes(445)) {
       host.os = 'unknown';
+      if (host.type === 'unknown') host.type = 'pc';
     }
   }
   
@@ -131,8 +193,7 @@ async function scanRange(startIP, endIP) {
   return results;
 }
 
-// ============ SSH TERMINAL WITH SSH2 ============
-
+// ============ STATIC FILES ============
 const HTML_DIR = __dirname;
 
 function serveStatic(res, filePath, contentType) {
@@ -147,6 +208,7 @@ function serveStatic(res, filePath, contentType) {
   });
 }
 
+// ============ HTTP SERVER ============
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const pathname = url.pathname;
@@ -161,7 +223,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // Static files
+  // Static files - relative paths
   if (pathname === '/' || pathname === '/index.html') {
     serveStatic(res, 'index.html', 'text/html');
     return;
@@ -193,7 +255,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API endpoints
+  // ============ API ENDPOINTS ============
+  
+  // Scan network
   if (pathname === '/api/scan' && req.method === 'POST') {
     let body = '';
     req.on('data', chunk => body += chunk);
@@ -222,6 +286,114 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
+  // Get data (whitelist + devices)
+  if (pathname === '/api/data' && req.method === 'GET') {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      success: true,
+      whitelist: appData.whitelist,
+      devices: appData.devices
+    }));
+    return;
+  }
+  
+  // Update whitelist
+  if (pathname === '/api/whitelist' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        appData.whitelist = data.whitelist || [];
+        saveData(appData);
+        
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  
+  // Add single IP to whitelist
+  if (pathname === '/api/whitelist/add' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const ip = data.ip;
+        
+        if (ip && !appData.whitelist.includes(ip)) {
+          appData.whitelist.push(ip);
+          saveData(appData);
+        }
+        
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  
+  // Remove IP from whitelist
+  if (pathname === '/api/whitelist/remove' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const ip = data.ip;
+        
+        appData.whitelist = appData.whitelist.filter(i => i !== ip);
+        saveData(appData);
+        
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  
+  // Update device (name, type)
+  if (pathname === '/api/device' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const ip = data.ip;
+        const name = data.name;
+        const type = data.type;
+        
+        if (ip) {
+          if (!appData.devices[ip]) {
+            appData.devices[ip] = {};
+          }
+          if (name !== undefined) appData.devices[ip].name = name;
+          if (type !== undefined) appData.devices[ip].type = type;
+          saveData(appData);
+        }
+        
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, device: appData.devices[ip] }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  
+  // Single ping
   if (pathname === '/api/ping' && req.method === 'GET') {
     const ip = url.searchParams.get('ip');
     if (ip) {
@@ -237,6 +409,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
+  // Single host scan
   if (pathname === '/api/host' && req.method === 'GET') {
     const ip = url.searchParams.get('ip');
     if (ip) {
@@ -250,6 +423,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
+  // SSH check
   if (pathname === '/api/ssh/check' && req.method === 'GET') {
     const ip = url.searchParams.get('ip');
     if (ip) {
@@ -268,7 +442,7 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// WebSocket for SSH terminal using ssh2
+// ============ WEBSOCKET FOR SSH ============
 const wss = new WebSocketServer({ server, path: '/ws/terminal' });
 const ansiUp = new AnsiUp();
 
@@ -291,8 +465,6 @@ wss.on('connection', (ws, req) => {
   
   conn.on('ready', () => {
     console.log(`[TERM] SSH connected to ${ip}`);
-    
-    // Send ready message first
     ws.send(JSON.stringify({ type: 'ready' }));
     
     conn.shell({ term: 'xterm-256color', cols: 120, rows: 30 }, (err, stream) => {
@@ -304,7 +476,6 @@ wss.on('connection', (ws, req) => {
       shell = stream;
       
       stream.on('data', (data) => {
-        // Send raw data - xterm handles ANSI
         ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }));
       });
       
@@ -325,45 +496,12 @@ wss.on('connection', (ws, req) => {
     ws.close();
   });
   
-  // Connect with password or try key-based
   conn.connect({
     host: ip,
     port: 22,
     username: username,
     password: password || undefined,
-    privateKey: password ? undefined : require('fs').readFileSync(process.env.HOME + '/.ssh/id_rsa'),
-    readyTimeout: 10000,
-    algorithms: {
-      kex: [
-        'ecdh-sha2-nistp256',
-        'ecdh-sha2-nistp384',
-        'ecdh-sha2-nistp521',
-        'diffie-hellman-group-exchange-sha256',
-        'diffie-hellman-group14-sha256',
-        'diffie-hellman-group14-sha1'
-      ],
-      cipher: [
-        'aes128-ctr',
-        'aes192-ctr',
-        'aes256-ctr',
-        'aes128-gcm@openssh.com',
-        'aes256-gcm@openssh.com'
-      ],
-      serverHostKey: [
-        'ssh-rsa',
-        'ecdsa-sha2-nistp256',
-        'ecdsa-sha2-nistp384',
-        'ecdsa-sha2-nistp521',
-        'ssh-ed25519',
-        'rsa-sha2-256',
-        'rsa-sha2-512'
-      ],
-      hmac: [
-        'hmac-sha2-256',
-        'hmac-sha2-512',
-        'hmac-sha1'
-      ]
-    }
+    readyTimeout: 10000
   });
   
   ws.on('message', (msg) => {
@@ -371,40 +509,15 @@ wss.on('connection', (ws, req) => {
       const data = JSON.parse(msg);
       if (data.type === 'input' && shell) {
         shell.write(data.data);
-      } else if (data.type === 'password' && !password) {
-        // Reconnect with password
-        conn.end();
-        conn.connect({
-          host: ip,
-          port: 22,
-          username: username,
-          password: data.password,
-          readyTimeout: 10000
-        });
       }
     } catch (e) {
       if (shell) shell.write(msg.toString());
     }
   });
-  
-  ws.on('close', () => {
-    if (conn) conn.end();
-  });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-╔═══════════════════════════════════════════╗
-║     NetControl - Network Scanner           ║
-║     http://localhost:${PORT}                   ║
-╚═══════════════════════════════════════════╝
-
-📡 API Endpoints:
-   POST /api/scan      - Scan IP range {start, end}
-   GET  /api/ping?ip=  - Ping single host
-   GET  /api/host?ip=  - Full host scan
-   GET  /api/ssh/check?ip= - Check SSH availability
-
-🖥️ Terminal: http://localhost:${PORT}/terminal.html?ip=&user=&pass=
-`);
+// Start server
+server.listen(PORT, () => {
+  console.log(`🚀 NetControl running on http://localhost:${PORT}`);
+  console.log(`📡 Data file: ${DATA_FILE}`);
 });
