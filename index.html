@@ -68,7 +68,8 @@
     .logo h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
     .logo span { font-size: 12px; color: var(--text-muted); font-weight: 400; }
     
-    .header-actions { display: flex; gap: 12px; }
+    .header-actions { display: flex; gap: 12px; align-items: center; }
+    .user-info { display: flex; align-items: center; gap: 12px; margin-right: 12px; color: var(--text-muted); }
     .btn {
       display: inline-flex;
       align-items: center;
@@ -122,6 +123,17 @@
     .stat-icon svg { width: 22px; height: 22px; }
     .stat-info h3 { font-size: 28px; font-weight: 700; letter-spacing: -1px; }
     .stat-info p { font-size: 13px; color: var(--text-muted); }
+    
+    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .section-header h3 { font-size: 16px; color: var(--text); }
+    .user-devices { display: flex; flex-wrap: wrap; gap: 8px; }
+    .device-row { display: flex; align-items: center; gap: 8px; background: var(--bg-tertiary); padding: 8px 12px; border-radius: 8px; }
+    .device-icon { font-size: 20px; }
+    .device-info { display: flex; flex-direction: column; }
+    .device-info strong { font-size: 13px; }
+    .device-info small { font-size: 11px; color: var(--text-dim); }
+    .btn-small { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
+    .btn-danger { background: var(--danger-dim); color: var(--danger); border: none; }
     
     .scan-controls {
       background: var(--card);
@@ -322,6 +334,10 @@
         <div><h1>NetControl</h1><span>Remote PC Manager</span></div>
       </div>
       <div class="header-actions">
+        <div class="user-info">
+          <span id="username-display">...</span>
+          <button class="btn" onclick="logout()">Salir</button>
+        </div>
         <button class="btn" id="refreshBtn" onclick="refreshScan()">Refresh</button>
         <button class="btn btn-primary" id="scanBtn" onclick="startScan()">Scan Network</button>
       </div>
@@ -355,6 +371,14 @@
     </div>
 
     <div class="scan-controls">
+      <div class="section-header">
+        <h3>🎯 Mis Dispositivos</h3>
+        <button class="btn btn-small" onclick="showAddDeviceModal()">+ Añadir</button>
+      </div>
+      <div id="user-devices" class="user-devices"></div>
+    </div>
+
+    <div class="scan-controls" style="margin-top: 16px;">
       <div class="scan-row">
         <div class="scan-range">
           <label>Subnet</label>
@@ -462,6 +486,104 @@
     let devices = {};
     let ipFilter = '';
     let showOffline = localStorage.getItem('showOffline') === 'true';
+    let currentUser = null;
+
+    // Check auth and load data
+    async function init() {
+      try {
+        const res = await fetch('/api/auth/me');
+        const data = await res.json();
+        if (!data.success) {
+          window.location.href = '/login.html';
+          return;
+        }
+        currentUser = data.username;
+        document.getElementById('username-display').textContent = data.username;
+        
+        // Load user's devices
+        loadUserDevices();
+        
+        // Load whitelist/data
+        const dataRes = await fetch('/api/data');
+        const dataJson = await dataRes.json();
+        if (dataJson.success) {
+          whitelist = dataJson.whitelist || [];
+          devices = dataJson.devices || {};
+        }
+        document.getElementById('show-offline').checked = showOffline;
+      } catch (e) {
+        console.error('Error:', e);
+        window.location.href = '/login.html';
+      }
+    }
+
+    async function loadUserDevices() {
+      try {
+        const res = await fetch('/api/devices');
+        const data = await res.json();
+        if (data.success) {
+          renderUserDevices(data.devices);
+        }
+      } catch (e) { console.error('Error loading devices:', e); }
+    }
+
+    function renderUserDevices(deviceList) {
+      const container = document.getElementById('user-devices');
+      if (!deviceList || deviceList.length === 0) {
+        container.innerHTML = '<p style="color: var(--text-dim);">No tienes dispositivos guardados</p>';
+        return;
+      }
+      container.innerHTML = deviceList.map(d => `
+        <div class="device-row">
+          <span class="device-icon">${d.type === 'Linux' ? '🐧' : d.type === 'Windows' ? '💻' : '🖥️'}</span>
+          <div class="device-info">
+            <strong>${d.name || d.ip}</strong>
+            <small>${d.ip}</small>
+          </div>
+          <button class="btn-small" onclick="connectToDevice('${d.ip}')">Conectar</button>
+          <button class="btn-small btn-danger" onclick="deleteDevice(${d.id})">✕</button>
+        </div>
+      `).join('');
+    }
+
+    async function deleteDevice(id) {
+      if (!confirm('¿Eliminar este dispositivo?')) return;
+      await fetch('/api/devices/' + id, { method: 'DELETE' });
+      loadUserDevices();
+    }
+
+    function connectToDevice(ip) {
+      // Quick scan this IP
+      startSingleScan(ip);
+    }
+
+    async function startSingleScan(ip) {
+      isScanning = true;
+      document.getElementById('scan-btn').textContent = 'Escaneando...';
+      
+      const res = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start: ip, end: ip })
+      });
+      const data = await res.json();
+      
+      if (data.success) {
+        hosts = data.hosts;
+        renderHosts();
+        updateStats();
+      }
+      
+      isScanning = false;
+      document.getElementById('scan-btn').textContent = 'Scan Network';
+    }
+
+    async function logout() {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      window.location.href = '/login.html';
+    }
+
+    init();
 
     // Load data on start
     async function loadData() {
@@ -781,6 +903,25 @@
     }
 
     function refreshScan() { if (!isScanning) startScan(); }
+
+    function showAddDeviceModal() {
+      const ip = prompt('IP del dispositivo:');
+      if (!ip) return;
+      const name = prompt('Nombre (opcional):') || '';
+      const type = prompt('Tipo (PC/Linux/Mac/Servidor):') || 'PC';
+      
+      fetch('/api/devices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, name, type })
+      }).then(r => r.json()).then(data => {
+        if (data.success) {
+          loadUserDevices();
+        } else {
+          alert(data.error || 'Error');
+        }
+      });
+    }
     
     async function pingHost(ip) {
       const btn = event.target;

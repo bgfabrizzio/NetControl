@@ -1,4 +1,4 @@
-const http = require('http');
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
@@ -6,40 +6,142 @@ const { dns } = require('dns').promises;
 const { WebSocketServer } = require('ws');
 const { Client } = require('ssh2');
 const { AnsiUp } = require('ansi_up');
+const session = require('express-session');
+const db = require('./db');
 
 const PORT = 3000;
+const app = express();
 
-// ============ DATA PERSISTENCE ============
-const DATA_FILE = path.join(__dirname, 'data.json');
+// Session config
+app.use(session({
+  secret: 'netcontrol-' + Math.random().toString(36).substr(2),
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 24 * 60 * 60 * 1000 }
+}));
 
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.error('[DATA] Error loading:', e.message);
+app.use(express.json());
+app.use(express.static(__dirname));
+
+// ============ AUTH MIDDLEWARE ============
+function requireAuth(req, res, next) {
+  if (req.session && req.session.userId) {
+    return next();
   }
-  return { whitelist: [], devices: {} };
+  res.status(401).json({ success: false, error: 'No autorizado' });
 }
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+// ============ AUTH ROUTES ============
 
-let appData = loadData();
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.json({ success: false, error: 'Usuario y contraseña requeridos' });
+    }
+    if (password.length < 3) {
+      return res.json({ success: false, error: 'Contraseña muy corta' });
+    }
+    const userId = await db.createUser(username, password);
+    req.session.userId = userId;
+    req.session.username = username;
+    res.json({ success: true, username });
+  } catch (err) {
+    if (err.message.includes('UNIQUE')) {
+      res.json({ success: false, error: 'Usuario ya existe' });
+    } else {
+      res.json({ success: false, error: err.message });
+    }
+  }
+});
 
-// ============ NETWORK SCANNER ============
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await db.getUser(username);
+    if (!user || !db.checkPassword(user, password)) {
+      return res.json({ success: false, error: 'Usuario o contraseña incorrectos' });
+    }
+    req.session.userId = user.id;
+    req.session.username = user.username;
+    res.json({ success: true, username: user.username });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
+
+// Check session
+app.get('/api/auth/me', (req, res) => {
+  if (req.session && req.session.userId) {
+    res.json({ success: true, username: req.session.username });
+  } else {
+    res.json({ success: false });
+  }
+});
+
+// ============ USER DEVICES ROUTES ============
+
+// Get user's devices
+app.get('/api/devices', requireAuth, async (req, res) => {
+  try {
+    const devices = await db.getDevices(req.session.userId);
+    res.json({ success: true, devices });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// Add device
+app.post('/api/devices', requireAuth, async (req, res) => {
+  try {
+    const { ip, name, type, ports } = req.body;
+    if (!ip) {
+      return res.json({ success: false, error: 'IP requerida' });
+    }
+    const id = await db.addDevice(req.session.userId, ip, name || '', type || 'PC', ports || '');
+    res.json({ success: true, id });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// Update device
+app.put('/api/devices/:id', requireAuth, async (req, res) => {
+  try {
+    const { name, type, ports } = req.body;
+    const changes = await db.updateDevice(req.params.id, req.session.userId, name, type, ports);
+    res.json({ success: changes > 0 });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// Delete device
+app.delete('/api/devices/:id', requireAuth, async (req, res) => {
+  try {
+    const changes = await db.deleteDevice(req.params.id, req.session.userId);
+    res.json({ success: changes > 0 });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ============ NETWORK SCANNER (原有的) ============
 
 async function ping(ip) {
   return new Promise((resolve) => {
     const cmd = process.platform === 'win32' 
       ? `ping -n 1 -w 800 ${ip}`
       : `ping -c 1 -W 1 ${ip}`;
-    
-    exec(cmd, { timeout: 2000 }, (err) => {
-      resolve(!err);
-    });
+    exec(cmd, { timeout: 2000 }, (err) => resolve(!err));
   });
 }
 
@@ -48,98 +150,37 @@ async function checkPort(ip, port) {
     const net = require('net');
     const socket = new net.Socket();
     socket.setTimeout(1500);
-    
-    socket.on('connect', () => {
-      socket.destroy();
-      resolve(true);
-    });
-    
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-    
-    socket.on('error', () => {
-      resolve(false);
-    });
-    
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('timeout', () => { socket.destroy(); resolve(false); });
+    socket.on('error', () => resolve(false));
     socket.connect(port, ip);
   });
 }
 
 async function getHostname(ip) {
-  try {
-    const hosts = await dns.reverse(ip);
-    return hosts[0] || null;
-  } catch {
-    return null;
-  }
+  try { const hosts = await dns.reverse(ip); return hosts[0] || null; } catch { return null; }
 }
 
 async function getMacAddress(ip) {
-  // Check if it's the local machine
   const localIP = require('os').networkInterfaces();
   for (const name in localIP) {
     for (const iface of localIP[name]) {
-      if (iface.address === ip) {
-        // This is a local interface, get its MAC
-        if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
-          console.log(`[MAC] Local interface: ${ip} -> ${iface.mac}`);
-          return iface.mac.toUpperCase();
-        }
+      if (iface.address === ip && iface.mac && iface.mac !== '00:00:00:00:00:00') {
+        return iface.mac.toUpperCase();
       }
     }
   }
-  
   return new Promise((resolve) => {
-    // Read /proc/net/arp directly first (might already have the MAC)
     try {
       const arpTable = require('fs').readFileSync('/proc/net/arp', 'utf8');
-      const lines = arpTable.split('\n');
-      for (const line of lines) {
+      for (const line of arpTable.split('\n')) {
         if (line.startsWith(ip + ' ')) {
-          const parts = line.split(/\s+/);
-          const mac = parts[3];
-          if (mac && mac !== '00:00:00:00:00:00') {
-            console.log(`[MAC] Found in cache: ${ip} -> ${mac}`);
-            resolve(mac.toUpperCase());
-            return;
-          }
+          const mac = line.split(/\s+/)[3];
+          if (mac && mac !== '00:00:00:00:00:00') { resolve(mac.toUpperCase()); return; }
         }
       }
-    } catch (e) {
-      console.log('[MAC] Error reading /proc/net/arp:', e.message);
-    }
-    
-    // If not in cache, ping and check again
-    const pingCmd = process.platform === 'win32' ? `ping -n 1 -w 500 ${ip}` : `ping -c 1 -W 1 ${ip}`;
-    
-    exec(pingCmd, { timeout: 3000 }, (err) => {
-      if (err) {
-        resolve(null);
-        return;
-      }
-      
-      // Try reading /proc/net/arp again after ping
-      try {
-        const arpTable = require('fs').readFileSync('/proc/net/arp', 'utf8');
-        const lines = arpTable.split('\n');
-        for (const line of lines) {
-          if (line.startsWith(ip + ' ')) {
-            const parts = line.split(/\s+/);
-            const mac = parts[3];
-            if (mac && mac !== '00:00:00:00:00:00') {
-              console.log(`[MAC] Found after ping: ${ip} -> ${mac}`);
-              resolve(mac.toUpperCase());
-              return;
-            }
-          }
-        }
-      } catch (e) {}
-      
-      console.log(`[MAC] Not found for ${ip}`);
-      resolve(null);
-    });
+    } catch (e) {}
+    resolve(null);
   });
 }
 
@@ -147,380 +188,123 @@ async function scanHost(ip) {
   const start = Date.now();
   const online = await ping(ip);
   const responseTime = Date.now() - start;
+  const mac = online ? await getMacAddress(ip) : null;
+  const hostname = await getHostname(ip).catch(() => null);
   
-  const isWhitelisted = appData.whitelist.includes(ip);
-  const customName = appData.devices[ip]?.name;
-  
-  const host = {
-    ip,
-    status: online ? 'online' : 'offline',
-    responseTime: online ? responseTime : null,
-    hostname: null,
-    mac: null,
-    os: 'unknown',
-    openPorts: [],
-    lastSeen: online ? new Date().toISOString() : null,
-    isWhitelisted,
-    customName: customName || null,
-    type: appData.devices[ip]?.type || 'unknown'
-  };
+  let os = 'unknown';
+  let ports = [];
   
   if (online) {
-    host.hostname = await getHostname(ip);
-    host.mac = await getMacAddress(ip);
+    const [rdp, ssh, vnc, https] = await Promise.all([
+      checkPort(ip, 3389),
+      checkPort(ip, 22),
+      checkPort(ip, 5900),
+      checkPort(ip, 443)
+    ]);
     
-    // Get device type from saved data
-    if (appData.devices[ip]) {
-      host.type = appData.devices[ip].type || 'unknown';
-      host.customName = appData.devices[ip].name || null;
-    }
+    if (rdp) ports.push(3389);
+    if (ssh) ports.push(22);
+    if (vnc) ports.push(5900);
+    if (https) ports.push(443);
     
-    const ports = [22, 80, 135, 139, 443, 445, 3389, 8080, 8443, 5900, 5000, 88, 548, 631, 9100];
-    const results = await Promise.allSettled(ports.map(p => checkPort(ip, p)));
-    
-    results.forEach((result, i) => {
-      if (result.status === 'fulfilled' && result.value) {
-        host.openPorts.push(ports[i]);
+    if (ports.length > 0) {
+      const [port1] = ports;
+      if (port1 === 22) os = 'linux';
+      else if (port1 === 3389) os = 'windows';
+      else {
+        const [http] = await Promise.all([checkPort(ip, 80)]);
+        if (http) {
+          os = await getHostname(ip).then(h => h ? 'linux' : 'unknown').catch(() => 'unknown');
+        }
       }
-    });
-    
-    // Detect OS based on open ports
-    if (host.openPorts.includes(5000) || host.openPorts.includes(548) || host.openPorts.includes(88)) {
-      host.os = 'macos';
-      if (host.type === 'unknown') host.type = 'mac';
-    } else if (host.openPorts.includes(22)) {
-      host.os = 'linux';
-      if (host.type === 'unknown') host.type = 'linux';
-    } else if (host.openPorts.includes(3389) || host.openPorts.includes(135)) {
-      host.os = 'windows';
-      if (host.type === 'unknown') host.type = 'pc';
-    } else if (host.openPorts.includes(631)) {
-      host.type = 'impresora';
-    } else if (host.openPorts.includes(9100)) {
-      host.type = 'impresora';
-    } else if (host.openPorts.includes(445)) {
-      host.os = 'unknown';
-      if (host.type === 'unknown') host.type = 'pc';
     }
   }
   
-  return host;
+  return { ip, status: online ? 'online' : 'offline', responseTime: online ? responseTime : null, mac, os, ports, hostname };
 }
 
 async function scanRange(startIP, endIP) {
-  const base = startIP.split('.').slice(0, 3).join('.');
-  const start = parseInt(startIP.split('.')[3]);
-  const end = parseInt(endIP.split('.')[3]);
+  const start = parseInt(startIP.split('.').pop());
+  const end = parseInt(endIP.split('.').pop());
+  const base = startIP.substring(0, startIP.lastIndexOf('.'));
   
-  const ips = [];
+  const hosts = [];
+  const promises = [];
+  
   for (let i = start; i <= end; i++) {
-    ips.push(`${base}.${i}`);
+    const ip = `${base}.${i}`;
+    promises.push(scanHost(ip).then(h => hosts.push(h)));
   }
   
-  console.log(`[SCANNER] Scanning ${ips.length} IPs...`);
-  
-  const results = [];
-  const batchSize = 30;
-  
-  for (let i = 0; i < ips.length; i += batchSize) {
-    const batch = ips.slice(i, i + batchSize);
-    const batchResults = await Promise.all(batch.map(ip => scanHost(ip)));
-    results.push(...batchResults);
-    
-    const progress = Math.round(((i + batchSize) / ips.length) * 100);
-    console.log(`[SCANNER] Progress: ${progress}%`);
-  }
-  
-  const online = results.filter(r => r.status === 'online').length;
-  console.log(`[SCANNER] Complete! ${online} hosts online.`);
-  
-  return results;
-}
-
-// ============ STATIC FILES ============
-const HTML_DIR = __dirname;
-
-function serveStatic(res, filePath, contentType) {
-  fs.readFile(path.join(HTML_DIR, filePath), (err, data) => {
-    if (err) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': contentType });
-    res.end(data);
+  await Promise.all(promises);
+  return hosts.sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
+    return parseInt(a.ip.split('.').pop()) - parseInt(b.ip.split('.').pop());
   });
 }
 
-// ============ HTTP SERVER ============
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const pathname = url.pathname;
-  
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Content-Type', 'application/json');
-  
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
+// ============ SCAN API (公开) ============
+app.post('/api/scan', async (req, res) => {
+  try {
+    const { start, end } = req.body;
+    const startIP = start || '192.168.227.1';
+    const endIP = end || '192.168.227.254';
+    console.log(`[API] Scan: ${startIP} - ${endIP}`);
+    const hosts = await scanRange(startIP, endIP);
+    res.json({ success: true, count: hosts.length, online: hosts.filter(h => h.status === 'online').length, hosts });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
-  
-  // Static files - relative paths
-  if (pathname === '/' || pathname === '/index.html') {
-    serveStatic(res, 'index.html', 'text/html');
-    return;
-  }
-  
-  if (pathname === '/terminal.html') {
-    serveStatic(res, 'terminal.html', 'text/html');
-    return;
-  }
-  
-  if (pathname === '/rdp.html') {
-    serveStatic(res, 'rdp.html', 'text/html');
-    return;
-  }
-  
-  // Serve noVNC static files
-  if (pathname.startsWith('/noVNC/')) {
-    const noVNCPath = pathname.slice(7);
-    const contentTypes = {
-      '.html': 'text/html',
-      '.js': 'application/javascript',
-      '.css': 'text/css',
-      '.json': 'application/json',
-      '.png': 'image/png',
-      '.svg': 'image/svg+xml'
-    };
-    const ext = path.extname(noVNCPath);
-    serveStatic(res, 'noVNC/' + (noVNCPath || 'vnc.html'), contentTypes[ext] || 'text/plain');
-    return;
-  }
-  
-  // ============ API ENDPOINTS ============
-  
-  // Scan network
-  if (pathname === '/api/scan' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const data = JSON.parse(body);
-        const startIP = data.start || '192.168.227.1';
-        const endIP = data.end || '192.168.227.254';
-        
-        console.log(`[API] Scan: ${startIP} - ${endIP}`);
-        const hosts = await scanRange(startIP, endIP);
-        
-        res.writeHead(200);
-        res.end(JSON.stringify({
-          success: true,
-          count: hosts.length,
-          online: hosts.filter(h => h.status === 'online').length,
-          hosts: hosts
-        }));
-      } catch (e) {
-        console.error('[API] Error:', e.message);
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  
-  // Get data (whitelist + devices)
-  if (pathname === '/api/data' && req.method === 'GET') {
-    res.writeHead(200);
-    res.end(JSON.stringify({
-      success: true,
-      whitelist: appData.whitelist,
-      devices: appData.devices
-    }));
-    return;
-  }
-  
-  // Update whitelist
-  if (pathname === '/api/whitelist' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        appData.whitelist = data.whitelist || [];
-        saveData(appData);
-        
-        res.writeHead(200);
-        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
-      } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  
-  // Add single IP to whitelist
-  if (pathname === '/api/whitelist/add' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const ip = data.ip;
-        
-        if (ip && !appData.whitelist.includes(ip)) {
-          appData.whitelist.push(ip);
-          saveData(appData);
-        }
-        
-        res.writeHead(200);
-        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
-      } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  
-  // Remove IP from whitelist
-  if (pathname === '/api/whitelist/remove' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const ip = data.ip;
-        
-        appData.whitelist = appData.whitelist.filter(i => i !== ip);
-        saveData(appData);
-        
-        res.writeHead(200);
-        res.end(JSON.stringify({ success: true, whitelist: appData.whitelist }));
-      } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  
-  // Update device (name, type)
-  if (pathname === '/api/device' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const ip = data.ip;
-        const name = data.name;
-        const type = data.type;
-        
-        if (ip) {
-          if (!appData.devices[ip]) {
-            appData.devices[ip] = {};
-          }
-          if (name !== undefined) appData.devices[ip].name = name;
-          if (type !== undefined) appData.devices[ip].type = type;
-          saveData(appData);
-        }
-        
-        res.writeHead(200);
-        res.end(JSON.stringify({ success: true, device: appData.devices[ip] }));
-      } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  
-  // Single ping
-  if (pathname === '/api/ping' && req.method === 'GET') {
-    const ip = url.searchParams.get('ip');
-    if (ip) {
-      const start = Date.now();
-      const online = await ping(ip);
-      const responseTime = Date.now() - start;
-      res.writeHead(200);
-      res.end(JSON.stringify({ ip, online, responseTime }));
-    } else {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: 'Missing ip param' }));
-    }
-    return;
-  }
-  
-  // Single host scan
-  if (pathname === '/api/host' && req.method === 'GET') {
-    const ip = url.searchParams.get('ip');
-    if (ip) {
-      const host = await scanHost(ip);
-      res.writeHead(200);
-      res.end(JSON.stringify(host));
-    } else {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: 'Missing ip param' }));
-    }
-    return;
-  }
-  
-  // SSH check
-  if (pathname === '/api/ssh/check' && req.method === 'GET') {
-    const ip = url.searchParams.get('ip');
-    if (ip) {
-      const hasSSH = await checkPort(ip, 22);
-      res.writeHead(200);
-      res.end(JSON.stringify({ ip, ssh: hasSSH }));
-    } else {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: 'Missing ip param' }));
-    }
-    return;
-  }
-  
-  // 404
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ============ WEBSOCKET FOR SSH ============
-const wss = new WebSocketServer({ server, path: '/ws/terminal' });
-const ansiUp = new AnsiUp();
+// ============ ACTIONS API (需要认证) ============
+app.post('/api/ping', requireAuth, async (req, res) => {
+  const { ip } = req.body;
+  const result = await ping(ip);
+  res.json({ success: true, online: result });
+});
+
+app.post('/api/rdp', requireAuth, (req, res) => {
+  const { ip } = req.body;
+  if (process.platform === 'win32') {
+    exec(`start mstsc /v:${ip}`);
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/ssh', requireAuth, (req, res) => {
+  const { ip } = req.body;
+  res.json({ success: true, url: `/terminal.html?ip=${ip}` });
+});
+
+// ============ WEBSOCKET FOR TERMINAL ============
+const server = app.listen(PORT, () => {
+  console.log(`🚀 NetControl running on http://localhost:${PORT}`);
+});
+
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const ip = url.searchParams.get('ip');
-  const username = url.searchParams.get('user') || 'manolo';
-  const password = url.searchParams.get('pass') || '';
+  const username = url.searchParams.get('user') || 'root';
+  const password = url.searchParams.get('pass');
   
-  if (!ip) {
-    ws.send(JSON.stringify({ type: 'error', data: 'Missing IP address' }));
-    ws.close();
-    return;
-  }
-  
-  console.log(`[TERM] SSH connection request: ${username}@${ip}`);
+  if (!ip) { ws.close(); return; }
   
   const conn = new Client();
   let shell = null;
+  const ansiUp = new AnsiUp();
   
   conn.on('ready', () => {
-    console.log(`[TERM] SSH connected to ${ip}`);
-    ws.send(JSON.stringify({ type: 'ready' }));
-    
-    conn.shell({ term: 'xterm-256color', cols: 120, rows: 30 }, (err, stream) => {
-      if (err) {
-        ws.send(JSON.stringify({ type: 'error', data: 'Error opening shell: ' + err.message }));
-        return;
-      }
-      
+    conn.shell((err, stream) => {
+      if (err) { ws.send(JSON.stringify({ type: 'error', data: err.message })); return; }
       shell = stream;
+      ws.send(JSON.stringify({ type: 'ready' }));
       
       stream.on('data', (data) => {
-        ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }));
+        const html = ansiUp.ansi_to_html(data.toString());
+        ws.send(JSON.stringify({ type: 'data', data: html }));
       });
       
       stream.on('close', () => {
@@ -531,37 +315,19 @@ wss.on('connection', (ws, req) => {
   });
   
   conn.on('error', (err) => {
-    console.error(`[TERM] SSH error: ${err.message}`);
-    ws.send(JSON.stringify({ type: 'error', data: 'Error de conexión: ' + err.message }));
+    ws.send(JSON.stringify({ type: 'error', data: err.message }));
   });
   
-  conn.on('close', () => {
-    ws.send(JSON.stringify({ type: 'close' }));
-    ws.close();
-  });
-  
-  conn.connect({
-    host: ip,
-    port: 22,
-    username: username,
-    password: password || undefined,
-    readyTimeout: 10000
-  });
+  conn.connect({ host: ip, port: 22, username, password, readyTimeout: 10000 });
   
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg);
-      if (data.type === 'input' && shell) {
-        shell.write(data.data);
-      }
+      if (data.type === 'input' && shell) shell.write(data.data);
     } catch (e) {
       if (shell) shell.write(msg.toString());
     }
   });
 });
 
-// Start server
-server.listen(PORT, () => {
-  console.log(`🚀 NetControl running on http://localhost:${PORT}`);
-  console.log(`📡 Data file: ${DATA_FILE}`);
-});
+console.log(`📡 WebSocket terminal ready`);
