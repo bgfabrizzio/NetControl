@@ -1,0 +1,14 @@
+[Unit]
+Description=NetControl Network Scanner
+After=network.target
+
+[Service]
+Type=simple
+User=manolo
+WorkingDirectory=/home/manolo/.openclaw/workspace/net-scan
+ExecStart=/home/manolo/.nvm/versions/node/v24.10.0/bin/node server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

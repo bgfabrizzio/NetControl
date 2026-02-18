@@ -77,24 +77,68 @@ async function getHostname(ip) {
 }
 
 async function getMacAddress(ip) {
+  // Check if it's the local machine
+  const localIP = require('os').networkInterfaces();
+  for (const name in localIP) {
+    for (const iface of localIP[name]) {
+      if (iface.address === ip) {
+        // This is a local interface, get its MAC
+        if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
+          console.log(`[MAC] Local interface: ${ip} -> ${iface.mac}`);
+          return iface.mac.toUpperCase();
+        }
+      }
+    }
+  }
+  
   return new Promise((resolve) => {
-    const cmd = process.platform === 'win32'
-      ? `arp -a ${ip}`
-      : `arp -n ${ip}`;
+    // Read /proc/net/arp directly first (might already have the MAC)
+    try {
+      const arpTable = require('fs').readFileSync('/proc/net/arp', 'utf8');
+      const lines = arpTable.split('\n');
+      for (const line of lines) {
+        if (line.startsWith(ip + ' ')) {
+          const parts = line.split(/\s+/);
+          const mac = parts[3];
+          if (mac && mac !== '00:00:00:00:00:00') {
+            console.log(`[MAC] Found in cache: ${ip} -> ${mac}`);
+            resolve(mac.toUpperCase());
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      console.log('[MAC] Error reading /proc/net/arp:', e.message);
+    }
     
-    exec(cmd, { timeout: 3000 }, (err, stdout) => {
+    // If not in cache, ping and check again
+    const pingCmd = process.platform === 'win32' ? `ping -n 1 -w 500 ${ip}` : `ping -c 1 -W 1 ${ip}`;
+    
+    exec(pingCmd, { timeout: 3000 }, (err) => {
       if (err) {
         resolve(null);
         return;
       }
       
-      // Parse MAC address from ARP output
-      const macMatch = stdout.match(/([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})/);
-      if (macMatch) {
-        resolve(macMatch[0].toUpperCase());
-      } else {
-        resolve(null);
-      }
+      // Try reading /proc/net/arp again after ping
+      try {
+        const arpTable = require('fs').readFileSync('/proc/net/arp', 'utf8');
+        const lines = arpTable.split('\n');
+        for (const line of lines) {
+          if (line.startsWith(ip + ' ')) {
+            const parts = line.split(/\s+/);
+            const mac = parts[3];
+            if (mac && mac !== '00:00:00:00:00:00') {
+              console.log(`[MAC] Found after ping: ${ip} -> ${mac}`);
+              resolve(mac.toUpperCase());
+              return;
+            }
+          }
+        }
+      } catch (e) {}
+      
+      console.log(`[MAC] Not found for ${ip}`);
+      resolve(null);
     });
   });
 }

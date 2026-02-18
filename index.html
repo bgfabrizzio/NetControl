@@ -306,6 +306,8 @@
       .scan-row .btn { width: 100%; justify-content: center; }
       .hosts-grid { grid-template-columns: 1fr; }
     }
+    .toggle-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; color: var(--text-muted); white-space: nowrap; margin-bottom: 8px; }
+    .toggle-label input { width: auto; }
   </style>
 </head>
 <body>
@@ -377,7 +379,12 @@
           <input type="text" id="ip-filter" class="subnet-select" placeholder="Buscar IP..." oninput="filterByIP()">
           <button type="button" class="clear-btn" onclick="document.getElementById('ip-filter').value='';filterByIP()">×</button>
         </div>
-        </div>
+        <label class="toggle-label">
+          <input type="checkbox" id="show-offline" onchange="localStorage.setItem('showOffline', this.checked); renderHosts()">
+          <span>Mostrar Offline</span>
+        </label>
+      </div>
+    </div>
         <button class="btn" onclick="openWhitelistModal()">⚙️ Mis PCs</button>
         <button class="btn btn-primary" onclick="scanWhitelistOnly()">⭐ Solo Mis PCs</button>
       </div>
@@ -454,6 +461,7 @@
     let whitelist = [];
     let devices = {};
     let ipFilter = '';
+    let showOffline = localStorage.getItem('showOffline') === 'true';
 
     // Load data on start
     async function loadData() {
@@ -464,6 +472,8 @@
           whitelist = data.whitelist || [];
           devices = data.devices || {};
         }
+        // Set toggle state
+        document.getElementById('show-offline').checked = showOffline;
       } catch (e) { console.error('Error loading data:', e); }
     }
     loadData();
@@ -672,6 +682,11 @@
         filteredHosts = hosts.filter(h => h.status === 'online' && h.os === 'macos');
       } else if (currentFilter === 'whitelist') {
         filteredHosts = hosts.filter(h => whitelist.includes(h.ip));
+      }
+      
+      // Hide offline if toggle unchecked
+      if (!showOffline) {
+        filteredHosts = filteredHosts.filter(h => h.status === 'online');
       }
       
       // Apply IP filter
